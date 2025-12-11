@@ -1,6 +1,8 @@
 // ZapHtmlParser.java
-// 修正版：改用 anchor-id 定位 Alert Detail，並從 <table class="results"> 的 row 區塊逐列解析
-// 需求：需要 jsoup + gson on classpath（同先前說明）
+// 修正版 V4：
+// 1. JSON 欄位修正：id -> pluginId, cwe -> cweId, wasc -> wascId
+// 2. 新增功能：在 AlertItem 中增加 count (Number of Instances)
+// 3. 修復 URL 轉義問題：Gson 輸出時不再將 = 轉為 \u003d，& 轉為 \u0026
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -23,13 +25,15 @@ public class ZapHtmlParser {
     public static class SummaryCounts { public Integer totalAlerts; public Integer high; public Integer medium; public Integer low; public Integer informational; public Integer falsePositives; }
     public static class SequenceStep { public String step; public String result; public String risk; }
     public static class Instance { public String url; public String method; public String parameter; public String attack; public String evidence; public String otherInfo; }
+
     public static class AlertItem {
-        public String id;
+        public String pluginId;
         public String name;
+        public Integer count;
         public String risk;
         public String confidence;
-        public String cwe;
-        public String wasc;
+        public String cweId;
+        public String wascId;
         public String description;
         public String solution;
         public String attack;
@@ -98,7 +102,7 @@ public class ZapHtmlParser {
         else if (key.contains("number of alerts") || key.contains("alerts") || key.contains("total")) sc.totalAlerts = val;
     }
 
-    // ===== parse sequences (keeps previous approach) =====
+    // ===== parse sequences =====
     private static List<SequenceStep> parseSummaryOfSequences(Document doc) {
         List<SequenceStep> out = new ArrayList<>();
         Element h = doc.select("h1,h2,h3,h4").stream().filter(x->clean(x.text()).toLowerCase().startsWith("summary of sequences")).findFirst().orElse(null);
@@ -123,12 +127,11 @@ public class ZapHtmlParser {
         return out;
     }
 
-    // ===== parse alerts list and link to details by anchor id =====
+    // ===== parse alerts list =====
     private static List<AlertItem> parseAlerts(Document doc) {
         List<AlertItem> out = new ArrayList<>();
         Element alertsTable = doc.select("table.alerts, table[class*=alerts]").stream().findFirst().orElse(null);
         if (alertsTable != null) {
-            // table rows: columns: name (with <a href="#id">), Risk Level, Number of Instances
             for (Element tr : alertsTable.select("tr:has(td)")) {
                 Elements tds = tr.select("td");
                 if (tds.size() < 1) continue;
@@ -137,98 +140,85 @@ public class ZapHtmlParser {
                 AlertItem item = new AlertItem();
                 if (link != null) {
                     String href = link.attr("href").trim();
-                    if (href.startsWith("#")) item.id = href.substring(1);
+                    if (href.startsWith("#")) item.pluginId = href.substring(1);
                     item.name = clean(link.text());
                 } else {
-                    // fallback: plain text in cell
                     item.name = clean(nameCell.text());
                 }
-                // risk cell if exists
+
                 if (tds.size() >= 2) {
                     item.risk = clean(tds.get(1).text());
                 }
-                // add and then fill details by id
+
+                if (tds.size() >= 3) {
+                    item.count = tryParseInt(clean(tds.get(2).text()));
+                }
+
                 out.add(item);
             }
         } else {
-            // fallback: find links in page that look like alerts
             for (Element a : doc.select("a[href]")) {
                 String txt = clean(a.text());
                 if (txt.length()>0 && txt.matches(".*[A-Za-z].*")) {
                     AlertItem it = new AlertItem();
                     String href = a.attr("href");
-                    if (href.startsWith("#")) it.id = href.substring(1);
+                    if (href.startsWith("#")) it.pluginId = href.substring(1);
                     it.name = txt;
                     out.add(it);
                 }
             }
         }
 
-        // Fill details for each alert using anchor id (preferred)
         for (AlertItem ai : out) {
             fillAlertDetailsById(doc, ai);
+            if (ai.count == null && !ai.instances.isEmpty()) {
+                ai.count = ai.instances.size();
+            }
         }
         return out;
     }
 
-    // ===== find anchor and parse the detail block that follows =====
+    // ===== find anchor and parse the detail block =====
     private static void fillAlertDetailsById(Document doc, AlertItem item) {
-        if (item.id==null || item.id.isBlank()) {
-            // fallback: search by name in headings / ths
+        if (item.pluginId==null || item.pluginId.isBlank()) {
             Element guess = doc.select("th,td,h2,h3,h4").stream().filter(e->clean(e.text()).toLowerCase().contains(item.name.toLowerCase())).findFirst().orElse(null);
             if (guess!=null) {
-                // parse from the table containing guess
                 Element tbl = guess.closest("table");
                 if (tbl!=null) parseAlertDetailFromResultsTable(tbl, item, guess);
             }
             return;
         }
-        // find anchor <a id="..."> (exact)
-        Element anchor = doc.selectFirst("a[id="+item.id+"]");
-        if (anchor == null) {
-            // sometimes id may be on an element other than <a> - try attribute search
-            anchor = doc.selectFirst("[id="+item.id+"]");
-        }
+        Element anchor = doc.selectFirst("a[id="+item.pluginId+"]");
+        if (anchor == null) anchor = doc.selectFirst("[id="+item.pluginId+"]");
         if (anchor == null) return;
 
-        // anchor is inside a table row that is the header for the alert detail
         Element tr = anchor.closest("tr");
         Element resultsTable = tr != null ? tr.closest("table") : null;
 
-        if (resultsTable != null && resultsTable.classNames().contains("results")) {
-            // parse detail from this table, starting from the row after the header row (the one containing the anchor)
-            parseAlertDetailFromResultsTable(resultsTable, item, tr);
-        } else if (resultsTable != null) {
-            // still try to parse
+        if (resultsTable != null) {
             parseAlertDetailFromResultsTable(resultsTable, item, tr);
         } else {
-            // fallback: search global tables for a <tr> that contains the anchor and parse from its table
             Element tab = anchor.closest("table");
             if (tab != null) parseAlertDetailFromResultsTable(tab, item, anchor.closest("tr"));
         }
     }
 
     private static void parseAlertDetailFromResultsTable(Element table, AlertItem item, Element headerRow) {
-        // get all rows and find index of headerRow
         List<Element> rows = table.select("tr");
         int startIndex = 0;
         if (headerRow != null) {
             for (int i=0;i<rows.size();i++){
                 if (rows.get(i).outerHtml().contains(headerRow.html())) { startIndex = i+1; break; }
             }
-        } else {
-            // default start at 0
-            startIndex = 0;
         }
 
-        // First: try to capture Description if present: look for a tr where first td/th contains "Description"
+        // 1. Description
         for (int i = startIndex; i < rows.size(); i++) {
             Element r = rows.get(i);
             Elements ths = r.select("th,td");
             if (ths.size()>=2) {
                 String left = clean(ths.get(0).text()).toLowerCase();
                 if (left.contains("description") || left.contains("描述")) {
-                    // the right cell contains description (could be many <div>)
                     item.description = ths.get(1).text().trim();
                     startIndex = i+1;
                     break;
@@ -236,7 +226,7 @@ public class ZapHtmlParser {
             }
         }
 
-        // Now parse sequential label:value rows into instances.
+        // 2. Instances
         List<Instance> instances = new ArrayList<>();
         Instance cur = null;
 
@@ -245,25 +235,17 @@ public class ZapHtmlParser {
             Elements tds = r.select("td");
             if (tds.size() == 0) continue;
 
-            // Some rows are header-like: if first cell contains nothing or is empty, skip
             String left = clean(tds.get(0).text());
-            String right = tds.size() >= 2 ? tds.get(1).html() : "";
 
-            // Detect if this row marks the start of a new alert header (a new <th> header row), stop parsing further
-            if (r.select("th").size() > 0 && r.select("th").text().length() > 0 && r.select("th a[id]").size()>0 && !r.outerHtml().contains("id=\""+item.id+"\"")) {
-                // encountered next alert header -> stop
+            // Check for next header
+            if (r.select("th").size() > 0 && r.select("th").text().length() > 0 && r.select("th a[id]").size()>0 && !r.outerHtml().contains("id=\""+item.pluginId+"\"")) {
                 break;
             }
 
-            // normalize label (Chinese/English)
             String label = left.toLowerCase().trim();
             if (label.equalsIgnoreCase("url") || label.equalsIgnoreCase("網址") || label.equals("url")) {
-                // start a new instance
-                if (cur != null) {
-                    instances.add(cur);
-                }
+                if (cur != null) instances.add(cur);
                 cur = new Instance();
-                // right cell may contain <a href="...">link</a>
                 Element a = tds.get(1).selectFirst("a[href]");
                 if (a != null) cur.url = clean(a.attr("href"));
                 else cur.url = clean(tds.get(1).text());
@@ -275,38 +257,29 @@ public class ZapHtmlParser {
                 cur.parameter = clean(tds.get(1).text());
             } else if (label.contains("attack") || label.contains("攻擊")) {
                 if (cur == null) cur = new Instance();
-                // Sometimes '攻擊' field is empty; we still set from right cell
                 cur.attack = clean(tds.get(1).text());
             } else if (label.toLowerCase().contains("evidence") || label.contains("證據")) {
                 if (cur == null) cur = new Instance();
-                // keep the raw HTML text for evidence (avoid losing < and >); convert HTML entities to text
                 cur.evidence = clean(tds.get(1).text());
             } else if (label.toLowerCase().contains("other info") || label.contains("其他資訊") || label.contains("other information")) {
                 if (cur == null) cur = new Instance();
                 cur.otherInfo = clean(tds.get(1).text());
-                // note: after Other Info, next row is likely next URL or next group
             } else {
-                // Could be global field like "Other Info" at alert-level (not instance-level)
-                // If left cell is "Other Info" but we haven't started an instance, store at alert level
                 if ((label.contains("other info") || label.contains("其他資訊") || label.contains("other information")) && cur==null) {
                     item.otherInfo = clean(tds.get(1).text());
                 }
-                // Also check for Attack at alert level
                 if ((label.contains("attack") || label.contains("攻擊")) && (cur==null)) {
                     item.attack = clean(tds.get(1).text());
                 }
-                // Also check for Evidence at alert level
                 if ((label.toLowerCase().contains("evidence") || label.contains("證據")) && (cur==null)) {
                     item.description = item.description == null ? clean(tds.get(1).text()) : item.description;
                 }
             }
         }
-
-        // push last cur
         if (cur != null) instances.add(cur);
         item.instances.addAll(instances);
 
-        // Also try to extract references / CWE / WASC / Solution from table rows (scan remaining rows)
+        // 3. Other meta
         for (Element r : table.select("tr")) {
             Elements tds2 = r.select("td,th");
             if (tds2.size() >= 2) {
@@ -317,9 +290,9 @@ public class ZapHtmlParser {
                 } else if (left.contains("references") || left.contains("參考")) {
                     if (right.length()>0) item.references.addAll(Arrays.asList(right.split("[;,]")));
                 } else if (left.contains("cwe")) {
-                    item.cwe = firstNonEmpty(item.cwe, right);
+                    item.cweId = firstNonEmpty(item.cweId, right);
                 } else if (left.contains("wasc")) {
-                    item.wasc = firstNonEmpty(item.wasc, right);
+                    item.wascId = firstNonEmpty(item.wascId, right);
                 } else if (left.contains("confidence")) {
                     item.confidence = firstNonEmpty(item.confidence, right);
                 }
@@ -347,7 +320,12 @@ public class ZapHtmlParser {
             report.sequences = parseSummaryOfSequences(doc);
             report.alerts = parseAlerts(doc);
 
-            Gson g = new GsonBuilder().setPrettyPrinting().create();
+            // 修改處：加入 disableHtmlEscaping() 避免 URL 中的 = 和 & 被轉義
+            Gson g = new GsonBuilder()
+                    .setPrettyPrinting()
+                    .disableHtmlEscaping()
+                    .create();
+
             try (Writer w = new OutputStreamWriter(new FileOutputStream(output), StandardCharsets.UTF_8)) {
                 w.write(g.toJson(report));
             }
