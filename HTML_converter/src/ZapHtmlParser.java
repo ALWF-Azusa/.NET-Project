@@ -1,469 +1,360 @@
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.*;
-import org.jsoup.select.Elements;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-
+// ZapHtmlParser.java
+// 修正版：改用 anchor-id 定位 Alert Detail，並從 <table class="results"> 的 row 區塊逐列解析
+// 需求：需要 jsoup + gson on classpath（同先前說明）
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.regex.Pattern;
 import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 
 public class ZapHtmlParser {
 
-    public static class Instance {
-        public String url;
-        public String method;
-        public String parameter;
-        public String evidence;
-    }
-
+    // ===== Data models =====
+    public static class ReportMeta { public String site; public String generatedOn; public String zapVersion; }
+    public static class SummaryCounts { public Integer totalAlerts; public Integer high; public Integer medium; public Integer low; public Integer informational; public Integer falsePositives; }
+    public static class SequenceStep { public String step; public String result; public String risk; }
+    public static class Instance { public String url; public String method; public String parameter; public String attack; public String evidence; public String otherInfo; }
     public static class AlertItem {
-        public String id;           // 例如 #alert-123（若可解析）
+        public String id;
         public String name;
-        public String risk;         // High / Medium / Low / Info
-        public String confidence;   // Confirmed / Medium / Low / False Positive ...
-        public String cwe;          // 例如 CWE-79
-        public String wasc;         // 例如 WASC-8
+        public String risk;
+        public String confidence;
+        public String cwe;
+        public String wasc;
         public String description;
         public String solution;
+        public String attack;
+        public String otherInfo;
         public List<String> references = new ArrayList<>();
         public List<Instance> instances = new ArrayList<>();
     }
+    public static class Report { public ReportMeta meta = new ReportMeta(); public SummaryCounts summary = new SummaryCounts(); public List<SequenceStep> sequences = new ArrayList<>(); public List<AlertItem> alerts = new ArrayList<>(); }
 
-    private static final Pattern LABEL_COLON = Pattern.compile("^\\s*([A-Za-z\\s/()_-]+)\\s*:\\s*(.*)$");
-    private static final List<String> RISK_WORDS = List.of("risk", "風險", "嚴重度");
-    private static final List<String> CONF_WORDS = List.of("confidence", "信心", "可信度");
-    private static final List<String> DESC_WORDS = List.of("description", "說明", "描述");
-    private static final List<String> SOL_WORDS  = List.of("solution", "解決方案", "修補建議");
-    private static final List<String> REF_WORDS  = List.of("reference", "references", "參考", "參考資料");
-    private static final List<String> CWE_WORDS  = List.of("cwe");
-    private static final List<String> WASC_WORDS = List.of("wasc");
+    // ===== utilities =====
+    private static String clean(String s) { if (s==null) return ""; return s.replace('\u00A0',' ').trim(); }
+    private static String afterColon(String s) { if (s==null) return null; int i=s.indexOf(':'); if (i<0) i=s.indexOf('：'); return (i>=0)? s.substring(i+1).trim() : s.trim(); }
+    private static Integer tryParseInt(String s) { try { String n = s.replaceAll("[^0-9]", ""); return n.isEmpty()? null: Integer.parseInt(n); } catch(Exception e){return null;} }
 
-    public static void main(String[] args) throws Exception {
-        List<String> argList = Arrays.asList(args);
-        String file = getOpt(argList, "--file", null);
+    // ===== parse meta =====
+    private static ReportMeta parseReportMeta(Document doc){
+        ReportMeta m = new ReportMeta();
+        Element body = doc.body();
+        for(Element e: body.select("h2,h3,h4,p,div,span,td")) {
+            String t = clean(e.text()).toLowerCase();
+            if (t.contains("site:") && m.site==null) m.site = afterColon(e.text());
+            else if (t.contains("generated on") && m.generatedOn==null) m.generatedOn = afterColon(e.text());
+            else if (t.contains("zap version") && m.zapVersion==null) m.zapVersion = afterColon(e.text());
+        }
+        return m;
+    }
 
-        // ✅ 如果沒傳參數，直接指定你要讀的那份檔案
-        if (file == null) {
-            // ← 這裡填你實際的 HTML 路徑，不要用 %20，要用正常空白或雙斜線
-            file = "C:\\Users\\Shih_Hsuan Yu\\Desktop\\Git Project\\data_place\\非電算中心委外系統清單\\2025-07-03-ZAP-Report-aleph.ncut.edu.tw.html";
+    // ===== parse summary of alerts =====
+    private static SummaryCounts parseSummaryOfAlerts(Document doc){
+        SummaryCounts sc = new SummaryCounts();
+        Element h = doc.select("h1,h2,h3,h4").stream().filter(x->clean(x.text()).equalsIgnoreCase("Summary of Alerts")).findFirst().orElse(null);
+        Element scope = (h!=null)? h.parent() : doc.body();
+        if (scope==null) return sc;
+        Element tbl = scope.select("table").stream().findFirst().orElse(null);
+        if (tbl != null) {
+            for (Element tr : tbl.select("tr")) {
+                Elements tds = tr.select("th,td");
+                if (tds.size()>=2) {
+                    String k = clean(tds.first().text());
+                    String v = clean(tds.last().text());
+                    fillSummaryCount(sc, k, v);
+                }
+            }
+        } else {
+            for (Element p : scope.select("p,li,div,span")) {
+                String s = clean(p.text());
+                if (s.isBlank()) continue;
+                String[] parts = s.split("[;]");
+                for (String part: parts) {
+                    String[] kv = part.split("[:]",2);
+                    if (kv.length==2) fillSummaryCount(sc, kv[0], kv[1]);
+                }
+            }
+        }
+        return sc;
+    }
+    private static void fillSummaryCount(SummaryCounts sc, String k, String v) {
+        String key = clean(k).toLowerCase();
+        Integer val = tryParseInt(v);
+        if (val==null) return;
+        if (key.contains("high")) sc.high = val;
+        else if (key.contains("medium")) sc.medium = val;
+        else if (key.contains("low")) sc.low = val;
+        else if (key.contains("informational") || key.contains("info")) sc.informational = val;
+        else if (key.contains("false")) sc.falsePositives = val;
+        else if (key.contains("number of alerts") || key.contains("alerts") || key.contains("total")) sc.totalAlerts = val;
+    }
+
+    // ===== parse sequences (keeps previous approach) =====
+    private static List<SequenceStep> parseSummaryOfSequences(Document doc) {
+        List<SequenceStep> out = new ArrayList<>();
+        Element h = doc.select("h1,h2,h3,h4").stream().filter(x->clean(x.text()).toLowerCase().startsWith("summary of sequences")).findFirst().orElse(null);
+        if (h==null) return out;
+        Element scope = h.parent();
+        Element tbl = scope.select("table").stream().findFirst().orElse(null);
+        if (tbl!=null) {
+            List<String> headers = tbl.select("tr").stream().findFirst().map(tr->tr.select("th,td").eachText().stream().map(ZapHtmlParser::clean).collect(Collectors.toList())).orElse(List.of());
+            for (Element tr: tbl.select("tr:has(td)")) {
+                List<String> cells = tr.select("td").eachText().stream().map(ZapHtmlParser::clean).collect(Collectors.toList());
+                SequenceStep s = new SequenceStep();
+                for (int i=0;i<Math.min(headers.size(), cells.size()); i++){
+                    String hn = headers.get(i).toLowerCase();
+                    String val = cells.get(i);
+                    if (hn.contains("step")) s.step = val;
+                    else if (hn.contains("result")) s.result = val;
+                    else if (hn.contains("risk")) s.risk = val;
+                }
+                if (s.step!=null||s.result!=null||s.risk!=null) out.add(s);
+            }
+        }
+        return out;
+    }
+
+    // ===== parse alerts list and link to details by anchor id =====
+    private static List<AlertItem> parseAlerts(Document doc) {
+        List<AlertItem> out = new ArrayList<>();
+        Element alertsTable = doc.select("table.alerts, table[class*=alerts]").stream().findFirst().orElse(null);
+        if (alertsTable != null) {
+            // table rows: columns: name (with <a href="#id">), Risk Level, Number of Instances
+            for (Element tr : alertsTable.select("tr:has(td)")) {
+                Elements tds = tr.select("td");
+                if (tds.size() < 1) continue;
+                Element nameCell = tds.get(0);
+                Element link = nameCell.selectFirst("a[href]");
+                AlertItem item = new AlertItem();
+                if (link != null) {
+                    String href = link.attr("href").trim();
+                    if (href.startsWith("#")) item.id = href.substring(1);
+                    item.name = clean(link.text());
+                } else {
+                    // fallback: plain text in cell
+                    item.name = clean(nameCell.text());
+                }
+                // risk cell if exists
+                if (tds.size() >= 2) {
+                    item.risk = clean(tds.get(1).text());
+                }
+                // add and then fill details by id
+                out.add(item);
+            }
+        } else {
+            // fallback: find links in page that look like alerts
+            for (Element a : doc.select("a[href]")) {
+                String txt = clean(a.text());
+                if (txt.length()>0 && txt.matches(".*[A-Za-z].*")) {
+                    AlertItem it = new AlertItem();
+                    String href = a.attr("href");
+                    if (href.startsWith("#")) it.id = href.substring(1);
+                    it.name = txt;
+                    out.add(it);
+                }
+            }
         }
 
-        // ✅ 檢查檔案是否存在
-        File htmlFile = new File(file);
-        if (!htmlFile.exists()) {
-            System.err.println("找不到檔案: " + htmlFile.getAbsolutePath());
+        // Fill details for each alert using anchor id (preferred)
+        for (AlertItem ai : out) {
+            fillAlertDetailsById(doc, ai);
+        }
+        return out;
+    }
+
+    // ===== find anchor and parse the detail block that follows =====
+    private static void fillAlertDetailsById(Document doc, AlertItem item) {
+        if (item.id==null || item.id.isBlank()) {
+            // fallback: search by name in headings / ths
+            Element guess = doc.select("th,td,h2,h3,h4").stream().filter(e->clean(e.text()).toLowerCase().contains(item.name.toLowerCase())).findFirst().orElse(null);
+            if (guess!=null) {
+                // parse from the table containing guess
+                Element tbl = guess.closest("table");
+                if (tbl!=null) parseAlertDetailFromResultsTable(tbl, item, guess);
+            }
             return;
         }
+        // find anchor <a id="..."> (exact)
+        Element anchor = doc.selectFirst("a[id="+item.id+"]");
+        if (anchor == null) {
+            // sometimes id may be on an element other than <a> - try attribute search
+            anchor = doc.selectFirst("[id="+item.id+"]");
+        }
+        if (anchor == null) return;
 
-        String out = getOpt(argList, "--out", "json");
-        boolean pretty = argList.contains("--pretty");
-        String csvOut = getOpt(argList, "--csvOut", null);
+        // anchor is inside a table row that is the header for the alert detail
+        Element tr = anchor.closest("tr");
+        Element resultsTable = tr != null ? tr.closest("table") : null;
 
-        // ✅ 解析 HTML
-        Document doc = Jsoup.parse(htmlFile, StandardCharsets.UTF_8.name());
-        List<AlertItem> alerts = parseAlerts(doc);
+        if (resultsTable != null && resultsTable.classNames().contains("results")) {
+            // parse detail from this table, starting from the row after the header row (the one containing the anchor)
+            parseAlertDetailFromResultsTable(resultsTable, item, tr);
+        } else if (resultsTable != null) {
+            // still try to parse
+            parseAlertDetailFromResultsTable(resultsTable, item, tr);
+        } else {
+            // fallback: search global tables for a <tr> that contains the anchor and parse from its table
+            Element tab = anchor.closest("table");
+            if (tab != null) parseAlertDetailFromResultsTable(tab, item, anchor.closest("tr"));
+        }
+    }
 
-        // ✅ 輸出 JSON 或 CSV
-        if ("csv".equalsIgnoreCase(out)) {
-            String csv = toCsv(alerts);
-            if (csvOut != null) {
-                try (FileWriter fw = new FileWriter(csvOut, StandardCharsets.UTF_8)) {
-                    fw.write(csv);
-                }
-                System.out.println("CSV 已輸出：" + csvOut);
-            } else {
-                System.out.println(csv);
+    private static void parseAlertDetailFromResultsTable(Element table, AlertItem item, Element headerRow) {
+        // get all rows and find index of headerRow
+        List<Element> rows = table.select("tr");
+        int startIndex = 0;
+        if (headerRow != null) {
+            for (int i=0;i<rows.size();i++){
+                if (rows.get(i).outerHtml().contains(headerRow.html())) { startIndex = i+1; break; }
             }
         } else {
-            Gson gson = pretty ? new GsonBuilder().setPrettyPrinting().create() : new Gson();
-            String json = gson.toJson(alerts);
-
-            String outputPath = "C:\\Users\\Shih_Hsuan Yu\\Desktop\\Git Project\\data_place\\JSON\\ZAP_output.json";
-
-
-            try (FileWriter fw = new FileWriter(outputPath, StandardCharsets.UTF_8)) {
-                fw.write(json);
-                System.out.println("✅ 已輸出 JSON 檔案到：" + outputPath);
-            }
-        }
-    }
-
-    private static String getOpt(List<String> args, String key, String defVal) {
-        int i = args.indexOf(key);
-        return (i >= 0 && i + 1 < args.size()) ? args.get(i + 1) : defVal;
-    }
-
-    /** 嘗試解析 alerts。策略：
-     * 1) 若有總表（table/列表）則先抓 alert 錨點 id → 再去詳細區塊取實例/描述等。
-     * 2) 否則直接掃描可能的詳細區塊（id 以 alert 開頭、或含風險/描述標籤的區段）。
-     */
-    public static List<AlertItem> parseAlerts(Document doc) {
-        Map<String, AlertItem> byId = new LinkedHashMap<>();
-        List<AlertItem> results = new ArrayList<>();
-
-        // --- 策略 1：從總表出發（常見在新舊版 ZAP 報告都有 summary 區） ---
-        Elements tableRows = doc.select("table#alertsTable tbody tr, table.alerts tbody tr, table#summaryTable tbody tr");
-        if (!tableRows.isEmpty()) {
-            for (Element tr : tableRows) {
-                // 找名稱與錨點
-                Element nameCell = firstNonNull(
-                        tr.selectFirst("td.alertname a[href^=#]"),
-                        tr.selectFirst("td a[href^=#]"),
-                        tr.selectFirst("td:nth-of-type(1) a[href^=#]"),
-                        tr.selectFirst("td:nth-of-type(1)")
-                );
-                if (nameCell == null) continue;
-
-                String name = cleanText(nameCell.text());
-                String href = nameCell.hasAttr("href") ? nameCell.attr("href").trim() : null;
-                String risk = guessRiskFromRow(tr);
-                String confidence = guessConfidenceFromRow(tr);
-
-                AlertItem item = new AlertItem();
-                item.name = name;
-                item.risk = risk;
-                item.confidence = confidence;
-                item.id = normalizeAnchor(href);
-                byId.put(item.id != null ? item.id : UUID.randomUUID().toString(), item);
-            }
+            // default start at 0
+            startIndex = 0;
         }
 
-        // 如果有 id，去詳細段落補齊
-        if (!byId.isEmpty()) {
-            for (Map.Entry<String, AlertItem> kv : byId.entrySet()) {
-                String id = kv.getKey();
-                AlertItem item = kv.getValue();
-                Element detail = (id != null && id.startsWith("#"))
-                        ? findByAnchorId(doc, id.substring(1))
-                        : null;
-                if (detail != null) {
-                    fillFromDetail(detail, item);
-                } else {
-                    // fallback：全文件找同名段落（風險不保證唯一，僅做輔助）
-                    Element byName = doc.select("h2, h3, h4").stream()
-                            .filter(h -> cleanText(h.text()).equalsIgnoreCase(item.name))
-                            .findFirst().orElse(null);
-                    if (byName != null) {
-                        fillFromDetail(byName.parent(), item);
-                    }
+        // First: try to capture Description if present: look for a tr where first td/th contains "Description"
+        for (int i = startIndex; i < rows.size(); i++) {
+            Element r = rows.get(i);
+            Elements ths = r.select("th,td");
+            if (ths.size()>=2) {
+                String left = clean(ths.get(0).text()).toLowerCase();
+                if (left.contains("description") || left.contains("描述")) {
+                    // the right cell contains description (could be many <div>)
+                    item.description = ths.get(1).text().trim();
+                    startIndex = i+1;
+                    break;
                 }
-                results.add(item);
-            }
-            return results;
-        }
-
-        // --- 策略 2：無總表時，直接掃所有可能的 alert 區塊 ---
-        Elements candidates = new Elements();
-        candidates.addAll(doc.select("div[id^=alert], section[id^=alert]"));
-        if (candidates.isEmpty()) {
-            // 再退一步：找含關鍵欄位的父容器（例如包含 Risk/Confidence/Description 的卡片）
-            candidates = doc.select("div, section, article").stream()
-                    .filter(el -> {
-                        String t = el.text().toLowerCase();
-                        return t.contains("risk") && t.contains("confidence") && (t.contains("description") || t.contains("solution"));
-                    })
-                    .collect(Elements::new, Elements::add, Elements::addAll);
-        }
-
-        for (Element block : candidates) {
-            AlertItem item = new AlertItem();
-            item.id = "#" + Optional.ofNullable(block.id()).orElse(UUID.randomUUID().toString());
-
-            // 名稱：優先用近的標題
-            Element title = firstNonNull(
-                    block.selectFirst("h2"), block.selectFirst("h3"), block.selectFirst("h4"),
-                    block.parent() != null ? block.parent().selectFirst("h2, h3, h4") : null
-            );
-            if (title != null) item.name = cleanText(title.text());
-
-            // 解析標籤:值 形式（Description:, Solution:, Risk:, Confidence:, CWE:, WASC:, References:）
-            fillLabeledFields(block, item);
-            // 解析實例表格
-            item.instances.addAll(extractInstances(block));
-
-            // 至少有名字或風險才收
-            if (item.name != null || item.risk != null || !item.instances.isEmpty()) {
-                results.add(item);
             }
         }
 
-        return results;
-    }
+        // Now parse sequential label:value rows into instances.
+        List<Instance> instances = new ArrayList<>();
+        Instance cur = null;
 
-    private static Element findByAnchorId(Document doc, String id) {
-        // 1) 直接 id 命中
-        Element e = doc.getElementById(id);
-        if (e != null) return e;
+        for (int i = startIndex; i < rows.size(); i++) {
+            Element r = rows.get(i);
+            Elements tds = r.select("td");
+            if (tds.size() == 0) continue;
 
-        // 2) a[name=id] 或 a[id=id]
-        Element a = doc.selectFirst("a[name=" + cssEscape(id) + "], a[id=" + cssEscape(id) + "]");
-        return a != null ? a.parent() : null;
-    }
+            // Some rows are header-like: if first cell contains nothing or is empty, skip
+            String left = clean(tds.get(0).text());
+            String right = tds.size() >= 2 ? tds.get(1).html() : "";
 
-    private static void fillFromDetail(Element detailRoot, AlertItem item) {
-        // 標題名
-        if (item.name == null) {
-            Element h = firstNonNull(detailRoot.selectFirst("h2"), detailRoot.selectFirst("h3"), detailRoot.selectFirst("h4"));
-            if (h != null) item.name = cleanText(h.text());
-        }
-        // 標籤欄位（Description: / Solution: / Risk: / Confidence: / CWE: / WASC: / References:）
-        fillLabeledFields(detailRoot, item);
-        // 實例（URLs/Instances table）
-        item.instances.addAll(extractInstances(detailRoot));
-    }
-
-    private static void fillLabeledFields(Element root, AlertItem item) {
-        // 常見版面：dl/dt/dd；也可能是 <p><b>Label:</b> text 或 table 的兩欄 label:value
-        // 1) dl 結構
-        for (Element dl : root.select("dl")) {
-            Elements dts = dl.select("dt");
-            for (Element dt : dts) {
-                Element dd = nextTagSibling(dt, "dd");
-                if (dd == null) continue;
-                assignByLabel(dt.text(), dd, item);
+            // Detect if this row marks the start of a new alert header (a new <th> header row), stop parsing further
+            if (r.select("th").size() > 0 && r.select("th").text().length() > 0 && r.select("th a[id]").size()>0 && !r.outerHtml().contains("id=\""+item.id+"\"")) {
+                // encountered next alert header -> stop
+                break;
             }
-        }
-        // 2) <p><b>Label:</b> value
-        for (Element p : root.select("p")) {
-            Element b = p.selectFirst("b, strong");
-            if (b != null) {
-                String bt = cleanText(b.text());
-                if (bt.endsWith(":")) {
-                    assignByLabel(bt, p, item);
-                } else {
-                    // 也可能是 "Risk: High" 在同個 <p> 文字裡
-                    assignByColonText(p.text(), item);
+
+            // normalize label (Chinese/English)
+            String label = left.toLowerCase().trim();
+            if (label.equalsIgnoreCase("url") || label.equalsIgnoreCase("網址") || label.equals("url")) {
+                // start a new instance
+                if (cur != null) {
+                    instances.add(cur);
                 }
+                cur = new Instance();
+                // right cell may contain <a href="...">link</a>
+                Element a = tds.get(1).selectFirst("a[href]");
+                if (a != null) cur.url = clean(a.attr("href"));
+                else cur.url = clean(tds.get(1).text());
+            } else if (label.contains("方法") || label.contains("method")) {
+                if (cur == null) cur = new Instance();
+                cur.method = clean(tds.get(1).text());
+            } else if (label.contains("parameter") || label.contains("參數")) {
+                if (cur == null) cur = new Instance();
+                cur.parameter = clean(tds.get(1).text());
+            } else if (label.contains("attack") || label.contains("攻擊")) {
+                if (cur == null) cur = new Instance();
+                // Sometimes '攻擊' field is empty; we still set from right cell
+                cur.attack = clean(tds.get(1).text());
+            } else if (label.toLowerCase().contains("evidence") || label.contains("證據")) {
+                if (cur == null) cur = new Instance();
+                // keep the raw HTML text for evidence (avoid losing < and >); convert HTML entities to text
+                cur.evidence = clean(tds.get(1).text());
+            } else if (label.toLowerCase().contains("other info") || label.contains("其他資訊") || label.contains("other information")) {
+                if (cur == null) cur = new Instance();
+                cur.otherInfo = clean(tds.get(1).text());
+                // note: after Other Info, next row is likely next URL or next group
             } else {
-                assignByColonText(p.text(), item);
+                // Could be global field like "Other Info" at alert-level (not instance-level)
+                // If left cell is "Other Info" but we haven't started an instance, store at alert level
+                if ((label.contains("other info") || label.contains("其他資訊") || label.contains("other information")) && cur==null) {
+                    item.otherInfo = clean(tds.get(1).text());
+                }
+                // Also check for Attack at alert level
+                if ((label.contains("attack") || label.contains("攻擊")) && (cur==null)) {
+                    item.attack = clean(tds.get(1).text());
+                }
+                // Also check for Evidence at alert level
+                if ((label.toLowerCase().contains("evidence") || label.contains("證據")) && (cur==null)) {
+                    item.description = item.description == null ? clean(tds.get(1).text()) : item.description;
+                }
             }
         }
-        // 3) table 兩欄 label:value
-        for (Element tr : root.select("table tr")) {
-            Elements tds = tr.select("td, th");
-            if (tds.size() >= 2) {
-                assignByLabel(tds.get(0).text(), tds.get(1), item);
-            } else if (tds.size() == 1) {
-                assignByColonText(tds.get(0).text(), item);
-            }
-        }
-        // 4) References 列表
-        if (item.references.isEmpty()) {
-            Elements refLists = root.select("ul, ol");
-            for (Element ul : refLists) {
-                // 粗略判斷該列表是否是參考資料（含 http/https 連結）
-                boolean hasLinks = !ul.select("a[href]").isEmpty();
-                if (hasLinks) {
-                    List<String> links = ul.select("a[href]").stream()
-                            .map(a -> a.attr("href").isBlank() ? cleanText(a.text()) : a.attr("href"))
-                            .collect(Collectors.toList());
-                    if (!links.isEmpty()) item.references.addAll(links);
+
+        // push last cur
+        if (cur != null) instances.add(cur);
+        item.instances.addAll(instances);
+
+        // Also try to extract references / CWE / WASC / Solution from table rows (scan remaining rows)
+        for (Element r : table.select("tr")) {
+            Elements tds2 = r.select("td,th");
+            if (tds2.size() >= 2) {
+                String left = clean(tds2.get(0).text()).toLowerCase();
+                String right = clean(tds2.get(1).text());
+                if (left.contains("solution") || left.contains("解決方案") || left.contains("建議")) {
+                    item.solution = firstNonEmpty(item.solution, right);
+                } else if (left.contains("references") || left.contains("參考")) {
+                    if (right.length()>0) item.references.addAll(Arrays.asList(right.split("[;,]")));
+                } else if (left.contains("cwe")) {
+                    item.cwe = firstNonEmpty(item.cwe, right);
+                } else if (left.contains("wasc")) {
+                    item.wasc = firstNonEmpty(item.wasc, right);
+                } else if (left.contains("confidence")) {
+                    item.confidence = firstNonEmpty(item.confidence, right);
                 }
             }
         }
     }
 
-    private static void assignByColonText(String text, AlertItem item) {
-        Matcher m = LABEL_COLON.matcher(text);
-        if (m.find()) {
-            String label = cleanText(m.group(1));
-            String val = cleanText(m.group(2));
-            writeField(label, val, item);
-        }
-    }
+    private static String firstNonEmpty(String a, String b) { if (a!=null && !a.isBlank()) return a; if (b!=null && !b.isBlank()) return b; return null; }
 
-    private static void assignByLabel(String labelText, Element valueEl, AlertItem item) {
-        String label = cleanText(labelText.replace("：", ":")); // 全形轉半形
-        String val = cleanText(valueEl.ownText().isBlank() ? valueEl.text() : valueEl.ownText());
-
-        // 若值空，試著抓 valueEl 後續文字
-        if (val.isBlank()) val = cleanText(valueEl.text());
-
-        if (writeField(label, val, item)) {
-            // ok
-        } else {
-            // 如果 label 本身就包含 "References"，把裡面的 link 一併收
-            if (matchAny(label, REF_WORDS)) {
-                List<String> links = valueEl.select("a[href]").stream()
-                        .map(a -> a.attr("href").isBlank() ? cleanText(a.text()) : a.attr("href"))
-                        .toList();
-                if (!links.isEmpty()) item.references.addAll(links);
+    // ===== main =====
+    public static void main(String[] args) {
+        String input = (args!=null && args.length>=1) ? args[0] : "report.html";
+        String output = (args!=null && args.length>=2) ? args[1] : "ZAP_output.json";
+        try {
+            File f = new File(input);
+            if (!f.exists()) {
+                System.err.println("找不到輸入檔案: " + f.getAbsolutePath());
+                System.exit(2);
             }
-        }
-    }
+            Document doc = Jsoup.parse(f, "UTF-8");
 
-    private static boolean writeField(String label, String value, AlertItem item) {
-        String l = label.toLowerCase();
-        if (matchAny(l, RISK_WORDS))        { item.risk = emptyThen(item.risk, value); return true; }
-        if (matchAny(l, CONF_WORDS))        { item.confidence = emptyThen(item.confidence, value); return true; }
-        if (matchAny(l, DESC_WORDS))        { item.description = emptyThen(item.description, value); return true; }
-        if (matchAny(l, SOL_WORDS))         { item.solution = emptyThen(item.solution, value); return true; }
-        if (matchAny(l, REF_WORDS))         { if (value!=null && !value.isBlank()) item.references.add(value); return true; }
-        if (matchAny(l, CWE_WORDS))         { item.cwe = emptyThen(item.cwe, value); return true; }
-        if (matchAny(l, WASC_WORDS))        { item.wasc = emptyThen(item.wasc, value); return true; }
-        // 也有些 ZAP 會把「CWE: 79 (XSS)」這類一起寫在文字裡，已由 assignByColonText 處理
-        return false;
-    }
+            Report report = new Report();
+            report.meta = parseReportMeta(doc);
+            report.summary = parseSummaryOfAlerts(doc);
+            report.sequences = parseSummaryOfSequences(doc);
+            report.alerts = parseAlerts(doc);
 
-    private static String emptyThen(String cur, String v) {
-        return (cur == null || cur.isBlank()) ? v : cur;
-    }
-
-    private static boolean matchAny(String s, List<String> keys) {
-        String t = s.toLowerCase();
-        for (String k : keys) {
-            if (t.contains(k.toLowerCase())) return true;
-        }
-        return false;
-    }
-
-    private static List<Instance> extractInstances(Element root) {
-        List<Instance> list = new ArrayList<>();
-
-        // 常見：一張 Instances/URLs 表
-        Elements tables = root.select("table");
-        for (Element tb : tables) {
-            // 先看表頭
-            Map<String, Integer> header = headerIndex(tb.selectFirst("thead"), tb.selectFirst("tr"));
-            if (header.isEmpty()) continue;
-
-            Elements rows = tb.select("tbody tr");
-            for (Element tr : rows) {
-                Instance ins = new Instance();
-                ins.url       = pickCell(tr, header, List.of("url", "uri", "地址", "連結"));
-                ins.method    = pickCell(tr, header, List.of("method", "http method", "方法"));
-                ins.parameter = pickCell(tr, header, List.of("parameter", "param", "參數", "變數"));
-                ins.evidence  = pickCell(tr, header, List.of("evidence", "證據", "片段"));
-                if (notAllEmpty(ins.url, ins.method, ins.parameter, ins.evidence)) {
-                    list.add(ins);
-                }
+            Gson g = new GsonBuilder().setPrettyPrinting().create();
+            try (Writer w = new OutputStreamWriter(new FileOutputStream(output), StandardCharsets.UTF_8)) {
+                w.write(g.toJson(report));
             }
+            System.out.println("輸出 JSON: " + new File(output).getAbsolutePath());
+        } catch (Exception e) {
+            System.err.println("解析失敗：" + e.getMessage());
+            e.printStackTrace();
         }
-
-        // 若表格沒抓到，退而求其次：找包含 URL 的清單
-        if (list.isEmpty()) {
-            for (Element a : root.select("a[href^=http], a[href^=/]")) {
-                Instance ins = new Instance();
-                ins.url = a.attr("href");
-                if (!ins.url.isBlank()) list.add(ins);
-            }
-        }
-        return list;
     }
-
-    private static Map<String, Integer> headerIndex(Element thead, Element firstRow) {
-        Elements ths = thead != null ? thead.select("th") : new Elements();
-        if (ths.isEmpty() && firstRow != null) ths = firstRow.select("th, td");
-        Map<String, Integer> map = new HashMap<>();
-        for (int i=0; i<ths.size(); i++) {
-            String key = cleanText(ths.get(i).text()).toLowerCase();
-            map.put(key, i);
-        }
-        return map;
-    }
-
-    private static String pickCell(Element tr, Map<String,Integer> header, List<String> wantKeys) {
-        Elements tds = tr.select("td");
-        if (tds.isEmpty()) return null;
-        // 嘗試依 key 包含關鍵字比對
-        for (Map.Entry<String,Integer> kv : header.entrySet()) {
-            for (String w : wantKeys) {
-                if (kv.getKey().contains(w.toLowerCase())) {
-                    int idx = kv.getValue();
-                    if (idx >= 0 && idx < tds.size()) {
-                        String v = cleanText(tds.get(idx).text());
-                        if (!v.isBlank()) return v;
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    private static String normalizeAnchor(String href) {
-        if (href == null || href.isBlank()) return null;
-        return href.startsWith("#") ? href : ("#" + href);
-    }
-
-    private static Element nextTagSibling(Element e, String tag) {
-        for (Node n = e.nextSibling(); n != null; n = n.nextSibling()) {
-            if (n instanceof Element el && el.tagName().equalsIgnoreCase(tag)) return el;
-        }
-        return null;
-    }
-
-    private static String cleanText(String s) {
-        if (s == null) return null;
-        return s.replace('\u00A0',' ').replaceAll("\\s+", " ").trim();
-    }
-
-    private static boolean notAllEmpty(String... ss) {
-        for (String s : ss) if (s != null && !s.isBlank()) return true;
-        return false;
-    }
-
-    private static Element firstNonNull(Element... els) {
-        for (Element e : els) if (e != null) return e;
-        return null;
-    }
-
-    private static String cssEscape(String s) {
-        // 簡易處理
-        return s.replace("\"","\\\"");
-    }
-
-    // --- CSV 匯出（摘要每個 alert 一列；instances 另以數量與第一筆 URL 表示）---
-    private static String toCsv(List<AlertItem> alerts) {
-        String[] headers = {"name","risk","confidence","cwe","wasc","instances_count","first_url"};
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.join(",", headers)).append("\n");
-        for (AlertItem a : alerts) {
-            String firstUrl = a.instances.isEmpty() ? "" : safeCsv(a.instances.get(0).url);
-            String line = String.join(",",
-                    safeCsv(a.name),
-                    safeCsv(a.risk),
-                    safeCsv(a.confidence),
-                    safeCsv(a.cwe),
-                    safeCsv(a.wasc),
-                    String.valueOf(a.instances.size()),
-                    firstUrl
-            );
-            sb.append(line).append("\n");
-        }
-        return sb.toString();
-    }
-
-    private static String safeCsv(String v) {
-        if (v == null) return "";
-        String s = v.replace("\"","\"\"");
-        if (s.contains(",") || s.contains("\"") || s.contains("\n")) {
-            return "\"" + s + "\"";
-        }
-        return s;
-    }
-    // 根據 <tr> 的文字內容判斷風險
-    private static String guessRiskFromRow(org.jsoup.nodes.Element tr) {
-        String text = tr.text().toLowerCase();
-        if (text.contains("high")) return "High";
-        if (text.contains("medium")) return "Medium";
-        if (text.contains("low")) return "Low";
-        if (text.contains("info")) return "Informational";
-        return "";
-    }
-    // 根據 <tr> 內容判斷 Confidence (信心等級)
-    private static String guessConfidenceFromRow(org.jsoup.nodes.Element tr) {
-        String text = tr.text().toLowerCase();
-        if (text.contains("high")) return "High";
-        if (text.contains("medium")) return "Medium";
-        if (text.contains("low")) return "Low";
-        if (text.contains("confirmed")) return "Confirmed";
-        return "";
-    }
-
-
-
 }
